@@ -23,10 +23,10 @@
 
 #include "GlobalStorage.h"
 #include "JobQueue.h"
-#include "Settings.h"
 #include "partition/FileSystem.h"
 #include "partition/PartitionQuery.h"
 #include "utils/Logger.h"
+#include "utils/Units.h"
 
 #include <kpmcore/core/device.h>
 #include <kpmcore/core/partition.h>
@@ -44,6 +44,8 @@
 
 using CalamaresUtils::Partition::untranslatedFS;
 using CalamaresUtils::Partition::userVisibleFS;
+using CalamaresUtils::operator""_GiB;
+using CalamaresUtils::operator""_MiB;
 
 static QSet< FileSystem::Type > s_unmountableFS( { FileSystem::Unformatted,
                                                    FileSystem::LinuxSwap,
@@ -53,6 +55,7 @@ static QSet< FileSystem::Type > s_unmountableFS( { FileSystem::Unformatted,
 
 CreatePartitionDialog::CreatePartitionDialog( Device* device,
                                               PartitionNode* parentPartition,
+                                              Partition* partition,
                                               const QStringList& usedMountPoints,
                                               QWidget* parentWidget )
     : QDialog( parentWidget )
@@ -81,6 +84,9 @@ CreatePartitionDialog::CreatePartitionDialog( Device* device,
         m_ui->lvNameLineEdit->setValidator( validator );
     }
 
+    standardMountPoints( *( m_ui->mountPointComboBox ),
+                         partition ? PartitionInfo::mountPoint( partition ) : QString() );
+
     if ( device->partitionTable()->type() == PartitionTable::msdos
          || device->partitionTable()->type() == PartitionTable::msdos_sectorbased )
     {
@@ -93,7 +99,7 @@ CreatePartitionDialog::CreatePartitionDialog( Device* device,
 
     // File system; the config value is translated (best-effort) to a type
     FileSystem::Type defaultFSType;
-    QString untranslatedFSName = PartUtils::canonicalFilesystemName(
+    QString untranslatedFSName = PartUtils::findFS(
         Calamares::JobQueue::instance()->globalStorage()->value( "defaultFileSystemType" ).toString(), &defaultFSType );
     if ( defaultFSType == FileSystem::Type::Unknown )
     {
@@ -105,9 +111,7 @@ CreatePartitionDialog::CreatePartitionDialog( Device* device,
     QStringList fsNames;
     for ( auto fs : FileSystemFactory::map() )
     {
-        // We need to ensure zfs is added to the list if the zfs module is enabled
-        if ( ( fs->type() == FileSystem::Type::Zfs && Calamares::Settings::instance()->isModuleEnabled( "zfs" ) )
-             || ( fs->supportCreate() != FileSystem::cmdSupportNone && fs->type() != FileSystem::Extended ) )
+        if ( fs->supportCreate() != FileSystem::cmdSupportNone && fs->type() != FileSystem::Extended )
         {
             fsNames << userVisibleFS( fs );  // This is put into the combobox
             if ( fs->type() == defaultFSType )
@@ -131,47 +135,13 @@ CreatePartitionDialog::CreatePartitionDialog( Device* device,
     // Select a default
     m_ui->fsComboBox->setCurrentIndex( defaultFsIndex );
     updateMountPointUi();
+
+    setFlagList( *( m_ui->m_listFlags ),
+                 static_cast< PartitionTable::Flags >( ~PartitionTable::Flags::Int( 0 ) ),
+                 partition ? PartitionInfo::flags( partition ) : PartitionTable::Flags() );
+
+    // Checks the initial selection.
     checkMountPointSelection();
-}
-
-CreatePartitionDialog::CreatePartitionDialog( Device* device,
-                                              const FreeSpace& freeSpacePartition,
-                                              const QStringList& usedMountPoints,
-                                              QWidget* parentWidget )
-    : CreatePartitionDialog( device, freeSpacePartition.p->parent(), usedMountPoints, parentWidget )
-{
-    standardMountPoints( *( m_ui->mountPointComboBox ), QString() );
-    setFlagList( *( m_ui->m_listFlags ),
-                 static_cast< PartitionTable::Flags >( ~PartitionTable::Flags::Int( 0 ) ),
-                 PartitionTable::Flags() );
-    initPartResizerWidget( freeSpacePartition.p );
-}
-
-CreatePartitionDialog::CreatePartitionDialog( Device* device,
-                                              const FreshPartition& existingNewPartition,
-                                              const QStringList& usedMountPoints,
-                                              QWidget* parentWidget )
-    : CreatePartitionDialog( device, existingNewPartition.p->parent(), usedMountPoints, parentWidget )
-{
-    standardMountPoints( *( m_ui->mountPointComboBox ), PartitionInfo::mountPoint( existingNewPartition.p ) );
-    setFlagList( *( m_ui->m_listFlags ),
-                 static_cast< PartitionTable::Flags >( ~PartitionTable::Flags::Int( 0 ) ),
-                 PartitionInfo::flags( existingNewPartition.p ) );
-
-    const bool isExtended = existingNewPartition.p->roles().has( PartitionRole::Extended );
-    if ( isExtended )
-    {
-        cDebug() << "Editing extended partitions is not supported.";
-        return;
-    }
-
-    initPartResizerWidget( existingNewPartition.p );
-
-    FileSystem::Type fsType = existingNewPartition.p->fileSystem().type();
-    m_ui->fsComboBox->setCurrentText( FileSystem::nameForType( fsType ) );
-
-    setSelectedMountPoint( m_ui->mountPointComboBox, PartitionInfo::mountPoint( existingNewPartition.p ) );
-    updateMountPointUi();
 }
 
 CreatePartitionDialog::~CreatePartitionDialog() {}
@@ -221,7 +191,7 @@ CreatePartitionDialog::initGptPartitionTypeUi()
 }
 
 Partition*
-CreatePartitionDialog::getNewlyCreatedPartition()
+CreatePartitionDialog::createPartition()
 {
     if ( m_role.roles() == PartitionRole::None )
     {
@@ -235,49 +205,17 @@ CreatePartitionDialog::getNewlyCreatedPartition()
     FileSystem::Type fsType = m_role.has( PartitionRole::Extended )
         ? FileSystem::Extended
         : FileSystem::typeForName( m_ui->fsComboBox->currentText() );
-    const QString fsLabel = m_ui->filesystemLabelEdit->text();
 
-    // The newly-created partitions have no flags set (no **active** flags),
-    // because they're new. The desired flags can be retrieved from
-    // newFlags() and the consumer (see PartitionPage::onCreateClicked)
-    // does so, to set up the partition for create-and-then-set-flags.
     Partition* partition = nullptr;
     QString luksPassphrase = m_ui->encryptWidget->passphrase();
-    if ( m_ui->encryptWidget->state() == EncryptWidget::Encryption::Confirmed && !luksPassphrase.isEmpty()
-         && fsType != FileSystem::Zfs )
+    if ( m_ui->encryptWidget->state() == EncryptWidget::Encryption::Confirmed && !luksPassphrase.isEmpty() )
     {
         partition = KPMHelpers::createNewEncryptedPartition(
-            m_parent, *m_device, m_role, fsType, fsLabel, first, last, luksPassphrase, PartitionTable::Flags() );
+            m_parent, *m_device, m_role, fsType, first, last, luksPassphrase, KPM_PARTITION_FLAG( None ) );
     }
     else
     {
-        partition = KPMHelpers::createNewPartition(
-            m_parent, *m_device, m_role, fsType, fsLabel, first, last, PartitionTable::Flags() );
-    }
-
-    // For zfs, we let the zfs module handle the encryption but we need to make the passphrase available to later modules
-    if ( fsType == FileSystem::Zfs )
-    {
-        Calamares::GlobalStorage* storage = Calamares::JobQueue::instance()->globalStorage();
-        QList< QVariant > zfsInfoList;
-        QVariantMap zfsInfo;
-
-        // If this is not the first encrypted zfs partition, get the old list first
-        if ( storage->contains( "zfsInfo" ) )
-        {
-            zfsInfoList = storage->value( "zfsInfo" ).toList();
-            storage->remove( "zfsInfo" );
-        }
-
-        // Save the information subsequent modules will need
-        zfsInfo[ "encrypted" ]
-            = m_ui->encryptWidget->state() == EncryptWidget::Encryption::Confirmed && !luksPassphrase.isEmpty();
-        zfsInfo[ "passphrase" ] = luksPassphrase;
-        zfsInfo[ "mountpoint" ] = selectedMountPoint( m_ui->mountPointComboBox );
-
-        // Add it to the list and insert it into global storage
-        zfsInfoList.append( zfsInfo );
-        storage->insert( "zfsInfo", zfsInfoList );
+        partition = KPMHelpers::createNewPartition( m_parent, *m_device, m_role, fsType, first, last, KPM_PARTITION_FLAG( None ) );
     }
 
     if ( m_device->type() == Device::Type::LVM_Device )
@@ -346,4 +284,35 @@ CreatePartitionDialog::initPartResizerWidget( Partition* partition )
     m_partitionSizeController->init( m_device, partition, color );
     m_partitionSizeController->setPartResizerWidget( m_ui->partResizerWidget );
     m_partitionSizeController->setSpinBox( m_ui->sizeSpinBox );
+}
+
+void
+CreatePartitionDialog::initFromFreeSpace( Partition* freeSpacePartition )
+{
+    initPartResizerWidget( freeSpacePartition );
+}
+
+void
+CreatePartitionDialog::initFromPartitionToCreate( Partition* partition )
+{
+    Q_ASSERT( partition );
+
+    bool isExtended = partition->roles().has( PartitionRole::Extended );
+    Q_ASSERT( !isExtended );
+    if ( isExtended )
+    {
+        cDebug() << "Editing extended partitions is not supported for now";
+        return;
+    }
+
+    initPartResizerWidget( partition );
+
+    // File System
+    FileSystem::Type fsType = partition->fileSystem().type();
+    m_ui->fsComboBox->setCurrentText( FileSystem::nameForType( fsType ) );
+
+    // Mount point
+    setSelectedMountPoint( m_ui->mountPointComboBox, PartitionInfo::mountPoint( partition ) );
+
+    updateMountPointUi();
 }
